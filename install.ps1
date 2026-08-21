@@ -500,6 +500,52 @@ try {
   }
   Write-Ok "Daemon health check passed"
 
+  # Restore telemetry parked by uninstall.ps1 -KeepData into the new system root.
+  $dataDirName = Split-Path -Leaf $Root
+  $preservedAnalytics = Join-Path (Join-Path $env:APPDATA $dataDirName) "analytics"
+  $systemAnalytics = Join-Path $Root "analytics"
+  if (Test-Path -LiteralPath $preservedAnalytics) {
+    Write-Step "Restoring preserved telemetry into the system analytics spool"
+    $systemHasData = (Test-Path -LiteralPath $systemAnalytics) -and
+      (Get-ChildItem -LiteralPath $systemAnalytics -Force -ErrorAction SilentlyContinue)
+    if ($systemHasData) {
+      Write-Warn "System analytics already present; leaving $preservedAnalytics in place"
+    } else {
+      $restoreLog = Join-Path $env:TEMP "hubbound-restore-analytics.log"
+      $runner = Join-Path $Tmp "hubbound-elevate-restore-analytics.ps1"
+      $srcLit = ConvertTo-SingleQuotedPsLiteral $preservedAnalytics
+      $destLit = ConvertTo-SingleQuotedPsLiteral $systemAnalytics
+      $logLit = ConvertTo-SingleQuotedPsLiteral $restoreLog
+      @(
+        '$ErrorActionPreference = "Continue"'
+        "New-Item -ItemType Directory -Path (Split-Path -Parent $destLit) -Force | Out-Null"
+        "Remove-Item -LiteralPath $destLit -Recurse -Force -ErrorAction SilentlyContinue"
+        "Copy-Item -LiteralPath $srcLit -Destination $destLit -Recurse -Force *>> $logLit"
+        "if (-not (Test-Path -LiteralPath $destLit)) { exit 1 }"
+        "exit 0"
+      ) | Set-Content -LiteralPath $runner -Encoding ASCII
+      $startProcessParameters = @{
+        FilePath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+        ArgumentList = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $runner)
+        Wait = $true
+        PassThru = $true
+      }
+      if (Test-IsAdministrator) {
+        $startProcessParameters["WindowStyle"] = "Hidden"
+      } else {
+        $startProcessParameters["Verb"] = "RunAs"
+      }
+      $process = Start-Process @startProcessParameters
+      if ($null -ne $process -and $process.ExitCode -eq 0) {
+        Remove-Item -LiteralPath $preservedAnalytics -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Ok "Restored telemetry to $systemAnalytics"
+      } else {
+        $code = if ($null -eq $process) { "uac-denied" } else { $process.ExitCode }
+        Write-Warn "Could not restore preserved telemetry (exit $code)"
+      }
+    }
+  }
+
   Write-Host ""
   Write-Color "Hubbound $Version is ready!" Green
   Write-Host ""

@@ -155,6 +155,31 @@ EOF
 fi
 ok "Daemon health check passed"
 
+# If a previous --keep-data uninstall parked telemetry under the user state
+# dir, move it back into the new system root so hubboundd resumes the spool.
+# User-state folder matches the system-root basename (hubbound vs hubbound-lab).
+data_dir_name=$(basename "$root")
+case "$os" in
+darwin) user_state="$HOME/Library/Application Support/$data_dir_name" ;;
+*) user_state="$HOME/.config/$data_dir_name" ;;
+esac
+preserved_analytics="$user_state/analytics"
+system_analytics="$root/analytics"
+if [ -d "$preserved_analytics" ]; then
+	step "Restoring preserved telemetry into the system analytics spool"
+	if [ -d "$system_analytics" ] && [ -n "$(ls -A "$system_analytics" 2>/dev/null)" ]; then
+		warn "System analytics already present; leaving $preserved_analytics in place"
+	else
+		sudo mkdir -p "$root"
+		sudo rm -rf "$system_analytics"
+		sudo cp -a "$preserved_analytics" "$system_analytics"
+		# Spool must stay root-owned like a fresh install (daemon runs as root).
+		sudo chown -R root:wheel "$system_analytics" 2>/dev/null || sudo chown -R root:root "$system_analytics" 2>/dev/null || true
+		rm -rf "$preserved_analytics"
+		ok "Restored telemetry to $system_analytics"
+	fi
+fi
+
 printf '\n%sHubbound %s is ready!%s\n\n' "$green" "$VERSION" "$reset"
 printf '%sGet started:%s\n' "$bold" "$reset"
 printf '  %shubbound auth login%s       connect your Hubbound account\n' "$cyan" "$reset"
