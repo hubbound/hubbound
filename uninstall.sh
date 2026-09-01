@@ -219,11 +219,12 @@ preserve_system_telemetry() {
     log_detail "From: $src"
     log_detail "To:   $dest"
     mkdir -p "$dest_parent"
-    if [ -d "$dest" ] && [ "$(find "$dest" -mindepth 1 -maxdepth 1 2>/dev/null | head -n1)" ]; then
-      # Keep both: stash the previous user copy, then take the system spool
-      # as the canonical preserved analytics.
-      local stash="${dest}.user-prior.$(date +%Y%m%d%H%M%S)"
-      mv "$dest" "$stash"
+	if [ -d "$dest" ] && [ "$(find "$dest" -mindepth 1 -maxdepth 1 2>/dev/null | head -n1)" ]; then
+		# Keep both: stash the previous user copy, then take the system spool
+		# as the canonical preserved analytics.
+		local stash
+		stash="${dest}.user-prior.$(date +%Y%m%d%H%M%S)"
+		mv "$dest" "$stash"
       log_detail "Existing user analytics moved aside: $stash"
     fi
     rm -rf "$dest"
@@ -364,14 +365,24 @@ fi
 # ─── User agent ──────────────────────────────────────────────────────────────
 log_info "Removing the user agent service"
 if [ "$OS" = "Darwin" ]; then
-  AGENT_PLIST="$HOME/Library/LaunchAgents/com.hubbound.agent.plist"
-  log_detail "Path: $AGENT_PLIST"
-  if [ -f "$AGENT_PLIST" ]; then
+  agent_seen=0
+  for AGENT_PLIST in \
+    "$HOME/Library/LaunchAgents/net.hubbound.agent.plist" \
+    "$HOME/Library/LaunchAgents/com.hubbound.agent.plist" \
+    "/Library/LaunchAgents/net.hubbound.agent.plist"; do
+    [ -e "$AGENT_PLIST" ] || [ -L "$AGENT_PLIST" ] || continue
+    agent_seen=1
+    log_detail "Path: $AGENT_PLIST"
     launchctl bootout "gui/$(id -u)" "$AGENT_PLIST" >/dev/null 2>&1 || true
     launchctl unload "$AGENT_PLIST" >/dev/null 2>&1 || true
-    rm -f "$AGENT_PLIST"
-    log_success "LaunchAgent removed"
-  else
+    if remove_path "$AGENT_PLIST"; then
+      log_success "LaunchAgent removed"
+    else
+      log_warn "Could not remove LaunchAgent plist"
+      PRIV_FAILURES=$((PRIV_FAILURES + 1))
+    fi
+  done
+  if [ "$agent_seen" -eq 0 ]; then
     log_warn "LaunchAgent plist not found"
   fi
 else
@@ -1063,5 +1074,8 @@ fi
 echo -e "    ${CYAN}→${NC} Open a new shell so the PATH change takes effect."
 echo -e "    ${CYAN}→${NC} Reinstall any time with:"
 echo ""
-echo -e "        ${BOLD}curl -fsSL $INSTALL_URL | sh${NC}"
+echo -e "        ${BOLD}curl -fsSLo ./hubbound-install.sh $INSTALL_URL${NC}"
+echo -e "        ${BOLD}less ./hubbound-install.sh${NC}"
+echo -e "        ${BOLD}sh ./hubbound-install.sh${NC}"
+echo -e "        ${BOLD}rm -f ./hubbound-install.sh${NC}"
 echo ""

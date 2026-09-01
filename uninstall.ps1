@@ -26,12 +26,25 @@ function Write-Warn([string]$Text) { Write-Color "  ! $Text" Yellow }
 function Write-Detail([string]$Text) { Write-Color "    > $Text" Cyan }
 function Write-Fail([string]$Text) { Write-Color "  x $Text" Red }
 
-$ReinstallCommand = "iwr https://raw.githubusercontent.com/hubbound/hubbound/main/install.ps1 -UseB | iex"
+$ReinstallCommand = "Download https://raw.githubusercontent.com/hubbound/hubbound/main/install.ps1, inspect it, then run: powershell -NoProfile -File .\\install.ps1"
 
 function Test-IsAdministrator {
   $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
   $principal = New-Object Security.Principal.WindowsPrincipal($identity)
   return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Get-HubboundProgramData {
+  # Resolve the machine-wide known folder on real Windows. Do not let a
+  # process-level ProgramData override redirect privileged cleanup to a
+  # user-writable directory. The fallback is only for Linux PowerShell tests.
+  if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+    $known = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
+    if (-not [string]::IsNullOrWhiteSpace($known)) { return $known }
+    return "C:\ProgramData"
+  }
+  if ($env:ProgramData) { return $env:ProgramData }
+  return "C:\ProgramData"
 }
 
 function ConvertTo-SingleQuotedPsLiteral([string]$Value) {
@@ -46,22 +59,26 @@ function Invoke-ElevatedScript {
   )
 
   Remove-Item -LiteralPath $LogPath -Force -ErrorAction SilentlyContinue
-  $runner = Join-Path $WorkDir "hubbound-elevate-uninstall.ps1"
-  @(
+  # Keep the elevated payload in memory. A generated .ps1 under the caller's
+  # temp directory could be replaced by the user between UAC approval and
+  # execution. The lines passed by callers contain only single-quoted,
+  # escaped data values.
+  $scriptLines = @(
     '$ErrorActionPreference = "Continue"'
     $Lines
     'exit $LASTEXITCODE'
-  ) | Set-Content -LiteralPath $runner -Encoding ASCII
+  )
+  $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes(($scriptLines -join [Environment]::NewLine)))
 
   if (Test-IsAdministrator) {
     & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
-      -NoProfile -ExecutionPolicy Bypass -File $runner
+      -NoProfile -EncodedCommand $encodedCommand
     return $LASTEXITCODE
   }
 
   Write-Warn "Windows will request administrator permission once to remove the system daemon."
   $process = Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
-    -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $runner) `
+    -ArgumentList @("-NoProfile", "-EncodedCommand", $encodedCommand) `
     -Verb RunAs -Wait -PassThru
   if ($null -eq $process) {
     throw "Administrator permission was not granted"
@@ -382,7 +399,7 @@ if ($Preview) {
 
 # Resolve Windows paths only after Preview: Linux pwsh containers lack
 # ProgramData / LOCALAPPDATA / APPDATA.
-$ProgramData = if ($env:ProgramData) { $env:ProgramData } else { "C:\ProgramData" }
+$ProgramData = Get-HubboundProgramData
 $LocalAppData = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { Join-Path $env:USERPROFILE "AppData\Local" }
 $AppData = if ($env:APPDATA) { $env:APPDATA } else { Join-Path $env:USERPROFILE "AppData\Roaming" }
 $HomeDir = if ($env:USERPROFILE) { $env:USERPROFILE } else { $env:HOME }
@@ -390,11 +407,10 @@ $HomeDir = if ($env:USERPROFILE) { $env:USERPROFILE } else { $env:HOME }
 # Release builds install under "hubbound"; dev builds under "hubbound-lab".
 # Without an explicit override both layouts may exist, so remove both.
 $DataDirNames = @("hubbound", "hubbound-lab")
-$SystemRoots = if ($env:HUBBOUND_SYSTEM_ROOT) {
-  @($env:HUBBOUND_SYSTEM_ROOT)
-} else {
-  @($DataDirNames | ForEach-Object { Join-Path $ProgramData $_ })
+if ($env:HUBBOUND_SYSTEM_ROOT) {
+  throw "Custom Windows system roots are not supported by the trusted uninstaller; use the machine-wide ProgramData root"
 }
+$SystemRoots = @($DataDirNames | ForEach-Object { Join-Path $ProgramData $_ })
 
 $UserBin = if ($env:HUBBOUND_USER_BIN) { $env:HUBBOUND_USER_BIN } else { Join-Path $LocalAppData "Hubbound\bin" }
 $UserStateDirs = @($DataDirNames | ForEach-Object { Join-Path $AppData $_ })
