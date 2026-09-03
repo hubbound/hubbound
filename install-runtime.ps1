@@ -218,7 +218,7 @@ function Invoke-InitialToolRepair {
     throw "Could not start Hubbound tool repair"
   }
   if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
-    # doctor may currently be waiting on git-ai or another provider child.
+    # doctor may currently be waiting on another provider child.
     # Process.Kill() in Windows PowerShell 5.1 only terminates the direct
     # process, so ask taskkill to close the full tree before using Kill as a
     # portable fallback.

@@ -474,55 +474,6 @@ else
   log_success "Removed $editors_removed editor integration director$([ "$editors_removed" -eq 1 ] && echo y || echo ies)"
 fi
 
-# ─── git-ai (full purge via uninstall-git-ai.sh) ──────────────────────────────
-log_info "Removing git-ai"
-GIT_AI_UNINSTALL=""
-for candidate in "$SCRIPT_DIR/uninstall-git-ai.sh" "$SCRIPT_DIR/dev/uninstall-git-ai.sh"; do
-  if [ -f "$candidate" ]; then
-    GIT_AI_UNINSTALL="$candidate"
-    break
-  fi
-done
-if [ -n "$GIT_AI_UNINSTALL" ]; then
-  log_detail "Using $GIT_AI_UNINSTALL"
-  # --yes skips the interactive prompt; same cleanup as the dedicated script
-  # (shutdown, uninstall-hooks, IDE hooks, bins, gitconfig, Cursor extension).
-  if bash "$GIT_AI_UNINSTALL" --yes; then
-    log_success "git-ai uninstalled"
-  else
-    log_warn "git-ai uninstall reported issues (continuing)"
-  fi
-else
-  log_warn "uninstall-git-ai.sh not found beside this script"
-  log_detail "Expected scripts/uninstall-git-ai.sh (published) or scripts/dev/uninstall-git-ai.sh"
-  # Minimal fallback when the companion script was not shipped with this copy.
-  gitai_bin=""
-  for candidate in \
-    "$HOME/.git-ai/bin/git-ai" \
-    "$HOME/.hubbound/bins/git-ai" \
-    "$USER_BIN/git-ai" \
-    "/usr/local/bin/git-ai" \
-    "/Library/Application Support/hubbound/current/git-ai" \
-    "/Library/Application Support/hubbound-lab/current/git-ai" \
-    "$(command -v git-ai 2>/dev/null || true)"; do
-    [ -n "$candidate" ] && [ -x "$candidate" ] || continue
-    gitai_bin="$candidate"
-    break
-  done
-  if [ -n "$gitai_bin" ]; then
-    log_detail "Fallback: $gitai_bin bg shutdown --hard"
-    "$gitai_bin" bg shutdown --hard >/dev/null 2>&1 || true
-    log_detail "Fallback: $gitai_bin uninstall-hooks"
-    "$gitai_bin" uninstall-hooks || log_warn "uninstall-hooks failed"
-  fi
-  for target in "$HOME/.git-ai" "$HOME/.hubbound/bins/git-ai" "$USER_BIN/git-ai" /usr/local/bin/git-ai; do
-    if [ -e "$target" ] || [ -L "$target" ]; then
-      remove_path "$target" || true
-    fi
-  done
-  log_warn "Fallback cleanup finished; re-run scripts/dev/uninstall-git-ai.sh --yes for a full purge"
-fi
-
 # ─── Provider integrations ───────────────────────────────────────────────────
 log_info "Cleaning provider integrations (hooks, MCP servers, artifacts)"
 PURGE_PROVIDERS_GO=""

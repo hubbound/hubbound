@@ -376,8 +376,6 @@ if ($Preview) {
   Write-Warn "Service not found, nothing to remove"
   Write-Step "Removing HubboundAgent user startup registration"
   Write-Ok "User startup registration removed"
-  Write-Step "Removing git-ai user state"
-  Write-Warn "git-ai not found, skipping"
   Write-Step "Removing system root"
   Write-Ok "System root removed"
   Write-Step "Removing user bin"
@@ -538,56 +536,6 @@ try {
   # --- User agent autostart -------------------------------------------------
   Write-Step "Removing HubboundAgent user startup registration"
   Remove-HubboundAgentTask -WorkDir $Tmp -LogPath $logPath -AgentPaths $AgentPaths
-
-  # --- git-ai: official uninstall-hooks first, then remove state -------------
-  Write-Step "Removing git-ai"
-  $GitAIDir = Join-Path $HomeDir ".git-ai"
-  $GitAIBins = @(
-    (Join-Path $GitAIDir "bin\git-ai.exe"),
-    (Join-Path $HomeDir ".hubbound\bins\git-ai.exe"),
-    (Join-Path $UserBin "git-ai.exe")
-  )
-  foreach ($root in $ExistingRoots) {
-    $GitAIBins += (Join-Path $root "current\git-ai.exe")
-    $GitAIBins += (Join-Path $root "bin\git-ai.exe")
-  }
-  $GitAIBin = $GitAIBins | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
-  if (-not $GitAIBin) {
-    $cmd = Get-Command git-ai.exe -ErrorAction SilentlyContinue
-    if ($cmd) { $GitAIBin = $cmd.Source }
-  }
-  $foundGitAI = ($null -ne $GitAIBin) -or (Test-Path -LiteralPath $GitAIDir) -or ($GitAIBins | Where-Object { Test-Path -LiteralPath $_ })
-  if ($foundGitAI) {
-    if ($GitAIBin) {
-      Write-Detail "Binary: $GitAIBin"
-      try {
-        & $GitAIBin bg shutdown --hard 2>$null | Out-Null
-        Write-Ok "git-ai background service stopped"
-      } catch {
-        Write-Warn "git-ai bg shutdown failed (continuing)"
-      }
-      try {
-        & $GitAIBin uninstall-hooks
-        Write-Ok "git-ai uninstall-hooks completed"
-      } catch {
-        Write-Warn "git-ai uninstall-hooks failed (continuing with file removal)"
-      }
-    } else {
-      Write-Warn "git-ai binary not found; skipping uninstall-hooks"
-    }
-    foreach ($bin in $GitAIBins) {
-      if (Test-Path -LiteralPath $bin) {
-        Remove-Item -LiteralPath $bin -Force -ErrorAction SilentlyContinue
-        Write-Detail "Removed $bin"
-      }
-    }
-    if (Test-Path -LiteralPath $GitAIDir) {
-      Remove-Item -LiteralPath $GitAIDir -Recurse -Force -ErrorAction SilentlyContinue
-    }
-    Write-Ok "git-ai user state removed"
-  } else {
-    Write-Warn "git-ai not found, skipping"
-  }
 
   # --- System roots (force if the helper left leftovers) --------------------
   Write-Step "Removing system root"
