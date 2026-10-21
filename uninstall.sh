@@ -431,6 +431,24 @@ for bin in hubbound hubbound-agent hubbound-helper; do
     bins_removed=$((bins_removed + 1))
   fi
 done
+# hbd is the short alias of hubbound. Remove it only when it is ours: a symlink
+# whose target is a file named hubbound (user bin links and the CLI PKG/DEB/RPM
+# link in /usr/local/bin or /usr/bin). A different hbd belongs to someone else.
+for alias_dir in "$USER_BIN" /usr/local/bin /usr/bin; do
+  alias_link="$alias_dir/hbd"
+  [ -L "$alias_link" ] || continue
+  case "$(readlink "$alias_link")" in
+  hubbound | */hubbound)
+    if remove_path "$alias_link"; then
+      log_success "Removed $alias_link"
+      bins_removed=$((bins_removed + 1))
+    else
+      log_warn "Could not remove $alias_link"
+    fi
+    ;;
+  *) log_warn "Leaving $alias_link: not a Hubbound alias" ;;
+  esac
+done
 if [ "$bins_removed" -eq 0 ]; then
   log_warn "No Hubbound commands found in $USER_BIN"
 fi

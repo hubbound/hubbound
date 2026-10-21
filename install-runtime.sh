@@ -67,6 +67,26 @@ fail() {
 }
 need() { command -v "$1" >/dev/null 2>&1 || fail "Missing required command: $1"; }
 
+# link_alias DIR TARGET installs DIR/hbd as a symlink to TARGET (a hubbound
+# binary). An existing hbd is replaced only when it is already a symlink to a
+# hubbound; anything else is someone else's command and is left alone.
+link_alias() {
+	alias_path="$1/hbd"
+	if [ -L "$alias_path" ]; then
+		case "$(readlink "$alias_path")" in
+		hubbound | */hubbound) ;;
+		*)
+			warn "Leaving existing $alias_path untouched: it is not a Hubbound alias"
+			return 0
+			;;
+		esac
+	elif [ -e "$alias_path" ]; then
+		warn "Leaving existing $alias_path untouched: it is not a Hubbound alias"
+		return 0
+	fi
+	ln -sf "$2" "$alias_path" && ok "Linked the hbd alias at $alias_path"
+}
+
 need curl
 need tar
 [ "$COMPONENT" = cli ] || need sudo
@@ -134,6 +154,7 @@ if [ "$COMPONENT" = cli ]; then
 	mkdir -p "$USER_BIN"
 	install -m 755 "$cli_bin" "$USER_BIN/hubbound" || fail "Could not install hubbound in $USER_BIN"
 	ok "Installed the standalone CLI at $USER_BIN/hubbound"
+	link_alias "$USER_BIN" hubbound
 	case ":$PATH:" in
 	*":$USER_BIN:"*) ;;
 	*)
@@ -259,6 +280,7 @@ if [ "$COMPONENT" = suite ]; then
 	for bin in hubbound hubbound-agent hubbound-helper; do
 		ln -sf "$root/current/$bin" "$USER_BIN/$bin"
 	done
+	link_alias "$USER_BIN" "$root/current/hubbound"
 	ok "Linked Hubbound commands at $USER_BIN"
 fi
 

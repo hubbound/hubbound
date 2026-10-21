@@ -41,6 +41,25 @@ function Write-Title([string]$Text) { Write-Host ""; Write-Color $Text Cyan; Wri
 function Write-Step([string]$Text) { Write-Color "  > $Text" Cyan }
 function Write-Ok([string]$Text) { Write-Color "  + $Text" Green }
 function Write-Warn([string]$Text) { Write-Color "  ! $Text" Yellow }
+
+# Install-HubboundAlias copies Source (the new hubbound.exe) to Directory\hbd.exe.
+# Call it before hubbound.exe in Directory is replaced: an existing hbd.exe is
+# ours only if it matches that previous copy or the new binary. Anything else is
+# someone else's command and is left alone.
+function Install-HubboundAlias([string]$Source, [string]$Directory) {
+  $alias = Join-Path $Directory "hbd.exe"
+  if (Test-Path -LiteralPath $alias) {
+    $known = @((Get-FileHash -LiteralPath $Source -Algorithm SHA256).Hash)
+    $previous = Join-Path $Directory "hubbound.exe"
+    if (Test-Path -LiteralPath $previous) { $known += (Get-FileHash -LiteralPath $previous -Algorithm SHA256).Hash }
+    if ($known -notcontains (Get-FileHash -LiteralPath $alias -Algorithm SHA256).Hash) {
+      Write-Warn "Leaving existing $alias untouched: it is not a Hubbound alias"
+      return
+    }
+  }
+  Copy-Item -LiteralPath $Source -Destination $alias -Force
+  Write-Ok "Installed the hbd alias at $alias"
+}
 function Write-Fail([string]$Text) { Write-Color "  x $Text" Red }
 
 function Get-HubboundWindowsArchitecture {
@@ -603,6 +622,7 @@ try {
     $Cli = Expand-HubboundArchiveMember -ArchivePath (Join-Path $Tmp $Archive) -DestinationPath $Tmp -MemberName "hubbound.exe"
     Write-Step "Installing the CLI in your user account"
     New-Item -ItemType Directory -Force -Path $UserBin | Out-Null
+    Install-HubboundAlias $Cli $UserBin
     Copy-Item $Cli (Join-Path $UserBin "hubbound.exe") -Force
     $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
     if ($null -eq $UserPath) { $UserPath = "" }
@@ -624,6 +644,7 @@ try {
   if ($Component -eq "suite") {
     Write-Step "Configuring your user session"
     New-Item -ItemType Directory -Force -Path $UserBin | Out-Null
+    Install-HubboundAlias (Join-Path $Root "current\hubbound.exe") $UserBin
     foreach ($Binary in @("hubbound.exe", "hubbound-agent.exe", "hubbound-helper.exe")) {
       Copy-Item (Join-Path $Root "current\$Binary") (Join-Path $UserBin $Binary) -Force
     }
