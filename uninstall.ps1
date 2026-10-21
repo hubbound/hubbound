@@ -429,6 +429,27 @@ $EditorDirs = @(
 $AgentPaths = @($SystemRoots | ForEach-Object { Join-Path $_ "current\hubbound-agent.exe" })
 $AgentPaths += (Join-Path $UserBin "hubbound-agent.exe")
 
+# --- Organization uninstall policy (HUB-173) ----------------------------------
+# Removing the suite removes every governed feature, so it is refused, before
+# anything is touched, when the organization forbids uninstalling any of them.
+# The CLI prints the red notice. Exit 77 is the policy denial; any other result
+# (CLI missing or older, device not enrolled, offline with no cached policy)
+# never blocks the uninstall.
+$PolicyCli = Join-Path $UserBin "hubbound.exe"
+if (-not (Test-Path -LiteralPath $PolicyCli)) {
+  $PolicyCmd = Get-Command hubbound.exe -ErrorAction SilentlyContinue
+  $PolicyCli = if ($PolicyCmd) { $PolicyCmd.Source } else { $null }
+}
+if ($PolicyCli) {
+  $global:LASTEXITCODE = 0
+  try {
+    & $PolicyCli internal policy-check --suite
+  } catch {
+    $global:LASTEXITCODE = 0
+  }
+  if ($LASTEXITCODE -eq 77) { exit 1 }
+}
+
 $KeepUserData = $false
 if ($KeepData) {
   $KeepUserData = $true
@@ -468,6 +489,25 @@ try {
 
   if ($KeepUserData -and $ExistingRoots.Count -gt 0) {
     Preserve-SystemTelemetry -Roots $ExistingRoots -AppDataRoot $AppData -WorkDir $Tmp -LogPath $logPath
+  }
+
+  # --- Report the uninstall (HUB-171) -----------------------------------------
+  # Tell the organization while the CLI and device credential still exist.
+  # Best effort: bounded by a timeout and never able to stop the uninstall.
+  # The helper below removes the service without going through `hubbound
+  # daemon uninstall`, so the daemon is reported here too.
+  $reportCli = Join-Path $UserBin "hubbound.exe"
+  if (-not (Test-Path -LiteralPath $reportCli)) {
+    $reportCmd = Get-Command hubbound.exe -ErrorAction SilentlyContinue
+    $reportCli = if ($reportCmd) { $reportCmd.Source } else { $null }
+  }
+  if ($reportCli) {
+    try {
+      $reportProc = Start-Process -FilePath $reportCli -ArgumentList @("internal", "feature-event", "--feature", "cli", "--feature", "daemon", "--sync") -WindowStyle Hidden -PassThru -ErrorAction Stop
+      if (-not $reportProc.WaitForExit(10000)) { Stop-Process -Id $reportProc.Id -Force -ErrorAction SilentlyContinue }
+    } catch {
+      Write-Detail "Uninstall report skipped: $($_.Exception.Message)"
+    }
   }
 
   # --- Daemon / system uninstall (elevated) ---------------------------------

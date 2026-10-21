@@ -127,6 +127,23 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# ─── Organization uninstall policy (HUB-173) ─────────────────────────────────
+# Removing the suite removes every governed feature, so it is refused, before
+# anything is touched, when the organization forbids uninstalling any of them.
+# The CLI prints the red notice. Exit 77 is the policy denial; any other result
+# (CLI missing or older, device not enrolled, offline with no cached policy)
+# never blocks the uninstall.
+enforce_uninstall_policy() {
+  command -v hubbound >/dev/null 2>&1 || return 0
+  local rc=0
+  hubbound internal policy-check --suite || rc=$?
+  if [ "$rc" -eq 77 ]; then
+    exit 1
+  fi
+  return 0
+}
+enforce_uninstall_policy
+
 if [ -z "$KEEP_DATA" ]; then
   if [ -t 0 ]; then
     echo ""
@@ -251,6 +268,20 @@ preserve_system_telemetry() {
 ensure_priv
 
 PRIV_FAILURES=0
+
+# Tell the organization this device is being uninstalled (HUB-171) while the
+# CLI and the device credential still exist. Runs as the invoking user, never
+# through sudo, so it uses that user's credential. Best effort: bounded to a
+# few seconds and never able to stop the uninstall.
+report_uninstall() {
+  command -v hubbound >/dev/null 2>&1 || return 0
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 10 hubbound internal feature-event --feature cli --sync >/dev/null 2>&1 || true
+  else
+    hubbound internal feature-event --feature cli --sync >/dev/null 2>&1 || true
+  fi
+}
+report_uninstall
 
 # Stop the daemon before copying analytics so spool files are not locked, then
 # preserve telemetry under --keep-data before helper RemoveAll's the system root.
