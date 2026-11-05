@@ -271,6 +271,41 @@ function Remove-HubboundMcpServers {
   Write-Detail "Removed MCP server(s) from ${Path}: $($removed -join ', ')"
 }
 
+# The Go installers write the HubBound MCP servers without an ownership marker,
+# so the fallback recognises them by name AND by running the hubbound CLI; a
+# server a user registered under the same name with another command is kept.
+$HubboundServerNames = @("hubbound-memories", "hubbound-live-docs", "hubbound-toolkit", "hubbound-artifacts")
+
+function Test-RunsHubbound {
+  param($Command)
+  if ($Command -is [Array]) { $Command = if ($Command.Count -gt 0) { $Command[0] } else { $null } }
+  if ($Command -isnot [string] -or [string]::IsNullOrWhiteSpace($Command)) { return $false }
+  $leaf = Split-Path -Leaf ($Command -replace '/', '\')
+  return ($leaf -eq "hubbound" -or $leaf -eq "hubbound.exe")
+}
+
+function Remove-HubboundNamedMcp {
+  param([string]$Path)
+  $doc = Read-JsonFile -Path $Path
+  if ($null -eq $doc) { return }
+  $changed = $false
+  foreach ($rootName in @("mcpServers", "servers", "mcp")) {
+    $servers = Get-JsonProperty -Object $doc -Name $rootName
+    if ($null -eq $servers -or $null -eq $servers.Value) { continue }
+    foreach ($name in $HubboundServerNames) {
+      $entry = Get-JsonProperty -Object $servers.Value -Name $name
+      if ($null -eq $entry) { continue }
+      $command = Get-JsonProperty -Object $entry.Value -Name "command"
+      if ($null -ne $command -and (Test-RunsHubbound -Command $command.Value)) {
+        $servers.Value.PSObject.Properties.Remove($name)
+        Write-Detail "Removed MCP server ${name} from $Path"
+        $changed = $true
+      }
+    }
+  }
+  if ($changed) { Write-JsonFile -Path $Path -Document $doc }
+}
+
 function Remove-HubboundHookEntries {
   param([string]$Path)
   $doc = Read-JsonFile -Path $Path
@@ -347,6 +382,13 @@ function Invoke-ProviderCleanupFallback {
 
   Remove-HubboundMcpServers -Path (Join-Path $HomeDir ".mcp.json")
   Remove-HubboundMcpServers -Path (Join-Path $HomeDir ".cursor\mcp.json")
+  foreach ($mcpFile in @(
+      ".claude.json", ".cursor\mcp.json", ".copilot\mcp-config.json",
+      ".gemini\config\mcp_config.json", ".gemini\antigravity-cli\mcp_config.json",
+      ".config\opencode\opencode.json", ".config\muse\settings.json",
+      "AppData\Roaming\Code\User\mcp.json")) {
+    Remove-HubboundNamedMcp -Path (Join-Path $HomeDir $mcpFile)
+  }
   Remove-HubboundHookEntries -Path (Join-Path $HomeDir ".cursor\hooks.json")
   Remove-HubboundHookEntries -Path (Join-Path $HomeDir ".claude\settings.json")
 
@@ -510,6 +552,26 @@ try {
     }
   }
 
+  # --- Provenance capture ---------------------------------------------------
+  # Owned by the daemon (global Trace2 git configuration), so it is switched off
+  # while the daemon still answers. Best effort, hidden, bounded.
+  if ($reportCli) {
+    Write-Step "Disabling provenance capture"
+    try {
+      $provProc = Start-Process -FilePath $reportCli -ArgumentList @("provenance", "remove") -WindowStyle Hidden -PassThru -ErrorAction Stop
+      if (-not $provProc.WaitForExit(20000)) {
+        Stop-Process -Id $provProc.Id -Force -ErrorAction SilentlyContinue
+        Write-Warn "Provenance capture did not answer in time"
+      } elseif ($provProc.ExitCode -eq 0) {
+        Write-Ok "Provenance capture disabled"
+      } else {
+        Write-Warn "Could not disable provenance capture (the daemon may be stopped already)"
+      }
+    } catch {
+      Write-Detail "Provenance capture skipped: $($_.Exception.Message)"
+    }
+  }
+
   # --- Daemon / system uninstall (elevated) ---------------------------------
   Write-Step "Stopping + removing hubboundd Windows service"
 
@@ -571,6 +633,27 @@ try {
     }
   } else {
     Write-Warn "Service not found, nothing to remove"
+  }
+
+  # --- AI tool integrations, through the CLI --------------------------------
+  # The installers that wrote the MCP servers (memories, live documents,
+  # artifacts), hooks, skills and instruction blocks know their ownership
+  # rules, so they remove them while the CLI still exists. The daemon is gone,
+  # so nothing re-adds them. The fallback below handles an older or missing CLI.
+  Write-Step "Removing MCP servers, hooks and skills from your AI tools"
+  if ($reportCli) {
+    try {
+      & $reportCli internal remove-integrations
+      if ($LASTEXITCODE -eq 0) {
+        Write-Ok "Integrations removed via 'hubbound internal remove-integrations'"
+      } else {
+        Write-Warn "'hubbound internal remove-integrations' failed (older CLI?); using the built-in cleaner"
+      }
+    } catch {
+      Write-Warn "'hubbound internal remove-integrations' failed: $($_.Exception.Message)"
+    }
+  } else {
+    Write-Warn "hubbound not found; using the built-in cleaner"
   }
 
   # --- User agent autostart -------------------------------------------------

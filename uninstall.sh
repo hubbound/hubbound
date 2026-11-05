@@ -283,6 +283,26 @@ report_uninstall() {
 }
 report_uninstall
 
+# Provenance capture is owned by the daemon (global Trace2 git configuration),
+# so it is switched off while the daemon still answers. Best effort: the
+# organization policy was already enforced above for the whole suite.
+disable_provenance() {
+  command -v hubbound >/dev/null 2>&1 || return 0
+  log_info "Disabling provenance capture"
+  local rc=0
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 20 hubbound provenance remove >/dev/null 2>&1 || rc=$?
+  else
+    hubbound provenance remove >/dev/null 2>&1 || rc=$?
+  fi
+  if [[ "$rc" -eq 0 ]]; then
+    log_success "Provenance capture disabled"
+  else
+    log_warn "Could not disable provenance capture (the daemon may be stopped already)"
+  fi
+}
+disable_provenance
+
 # Stop the daemon before copying analytics so spool files are not locked, then
 # preserve telemetry under --keep-data before helper RemoveAll's the system root.
 log_info "Stopping hubboundd before teardown"
@@ -307,6 +327,23 @@ if [ "$stopped" -eq 0 ]; then
 fi
 
 preserve_system_telemetry
+
+# ─── AI tool integrations, through the CLI ───────────────────────────────────
+# The installers that wrote the MCP servers (memories, live documents,
+# artifacts), hooks, skills and instruction blocks know their exact ownership
+# rules, so they remove them while the CLI still exists. The daemon is already
+# stopped, so nothing re-adds them. Best effort: the built-in cleaner further
+# down still handles what an older or missing CLI cannot.
+log_info "Removing MCP servers, hooks and skills from your AI tools"
+if command -v hubbound >/dev/null 2>&1; then
+  if hubbound internal remove-integrations; then
+    log_success "Integrations removed via 'hubbound internal remove-integrations'"
+  else
+    log_warn "'hubbound internal remove-integrations' failed (older CLI?); using the built-in cleaner"
+  fi
+else
+  log_warn "hubbound not on PATH; using the built-in cleaner"
+fi
 
 # ─── Daemon ──────────────────────────────────────────────────────────────────
 log_info "Stopping and removing the hubboundd system daemon"
@@ -484,6 +521,27 @@ if [ "$bins_removed" -eq 0 ]; then
   log_warn "No Hubbound commands found in $USER_BIN"
 fi
 
+# ─── Notifier app (macOS) ────────────────────────────────────────────────────
+# HubBound Notifier.app lives inside the system root release directory (removed
+# with the root above); copies installed beside the user's applications go too.
+if [[ "$OS" = "Darwin" ]]; then
+  log_info "Removing the HubBound Notifier app"
+  notifier_removed=0
+  for app in "$HOME/Applications/HubBound Notifier.app" "/Applications/HubBound Notifier.app"; do
+    [[ -e "$app" ]] || continue
+    log_detail "Path: $app"
+    if remove_path "$app"; then
+      log_success "Removed $app"
+      notifier_removed=$((notifier_removed + 1))
+    else
+      log_warn "Could not remove $app"
+    fi
+  done
+  if [[ "$notifier_removed" -eq 0 ]]; then
+    log_warn "No standalone HubBound Notifier app found"
+  fi
+fi
+
 # ─── Shell PATH block ────────────────────────────────────────────────────────
 log_info "Removing the shell PATH entry"
 rc_cleaned=0
@@ -602,11 +660,38 @@ def write_json(path, doc):
     ok(f"cleaned {path}")
 
 
+OWN_SERVERS = ("hubbound-memories", "hubbound-live-docs", "hubbound-toolkit", "hubbound-artifacts")
+HOOK_COMMAND = re.compile(r"hubbound(?:\.exe)?['\"]?\s+(?:memory|workspace|live-docs|live-planning)\s+hook\b")
+
+
+def runs_hubbound(command):
+    """True when command (a string or an argv list) starts the hubbound CLI."""
+    if isinstance(command, list):
+        command = command[0] if command else None
+    return isinstance(command, str) and os.path.basename(command.replace("\\", "/")) in ("hubbound", "hubbound.exe")
+
+
+def is_hook_command(value):
+    """Hooks the Go installers wrote carry no marker: they run `hubbound ... hook`."""
+    if not isinstance(value, dict):
+        return False
+    args = value.get("args")
+    if runs_hubbound(value.get("command")) and isinstance(args, list) and "hook" in [str(a) for a in args[:3]]:
+        return True
+    for key in ("command", "command_windows", "commandWindows", "bash", "powershell"):
+        text = value.get(key)
+        if isinstance(text, str) and HOOK_COMMAND.search(text):
+            return True
+    return False
+
+
 def is_hubbound(value):
     if not isinstance(value, dict):
         return False
     marker = value.get("hubbound")
-    return isinstance(marker, dict) and marker.get("source") == "hubbound"
+    if isinstance(marker, dict) and marker.get("source") == "hubbound":
+        return True
+    return is_hook_command(value)
 
 
 def clean_mcp_servers(*paths):
@@ -623,6 +708,38 @@ def clean_mcp_servers(*paths):
         for name in removed:
             del servers[name]
             detail(f"removed MCP server: {name}")
+        write_json(path, doc)
+
+
+def clean_named_mcp(path):
+    """Removes the HubBound MCP servers (memories, live documents, toolkit and its
+    former name, artifacts).
+
+    The Go installers write them without an ownership marker, so they are
+    recognised by name AND by running the hubbound CLI; a server a user
+    registered under the same name with another command is left alone.
+    """
+    doc = read_json(path)
+    if not doc:
+        return
+    changed = False
+    for root in ("mcpServers", "servers", "mcp"):
+        servers = doc.get(root)
+        if not isinstance(servers, dict):
+            continue
+        for name in OWN_SERVERS:
+            entry = servers.get(name)
+            if isinstance(entry, dict) and runs_hubbound(entry.get("command")):
+                del servers[name]
+                detail(f"removed MCP server: {name}")
+                changed = True
+    allow = doc.get("permissions", {}).get("allow") if isinstance(doc.get("permissions"), dict) else None
+    if isinstance(allow, list):
+        kept = [a for a in allow if not (isinstance(a, str) and any(name in a for name in OWN_SERVERS))]
+        if len(kept) != len(allow):
+            doc["permissions"]["allow"] = kept
+            changed = True
+    if changed:
         write_json(path, doc)
 
 
@@ -668,6 +785,13 @@ def clean_claude_settings(path):
         del doc["statusLine"]
         changed = True
         detail("removed legacy Claude display config")
+
+    allow = doc.get("permissions", {}).get("allow") if isinstance(doc.get("permissions"), dict) else None
+    if isinstance(allow, list):
+        kept = [a for a in allow if not (isinstance(a, str) and any(name in a for name in OWN_SERVERS))]
+        if len(kept) != len(allow):
+            doc["permissions"]["allow"] = kept
+            changed = True
 
     if changed:
         write_json(path, doc)
@@ -867,6 +991,9 @@ def clean_codex_config(path):
             if block["path"][-1] == "hubbound" and any(TOML_SOURCE.match(l) for l in block["lines"]):
                 marked = True
                 break
+            if len(block["path"]) == 2 and block["path"][0] == "mcp_servers" and block["path"][1] in OWN_SERVERS:
+                marked = True
+                break
         if marked:
             drop.add(index)
 
@@ -927,9 +1054,65 @@ def clean_codex_agents(directory):
             detail(f"removed subagent: {name}")
 
 
+def remove_owned_plugin(path):
+    """Removes an OpenCode plugin file or directory written by the Memories installer."""
+    header = "HubBound managed"
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                owned = header in handle.read(512)
+        except OSError:
+            return
+        if owned:
+            remove_paths(path)
+    elif os.path.isdir(path):
+        for name in sorted(os.listdir(path)):
+            target = os.path.join(path, name)
+            try:
+                with open(target, "r", encoding="utf-8", errors="replace") as handle:
+                    if header in handle.read(512):
+                        remove_paths(path)
+                        return
+            except OSError:
+                continue
+
+
+def clean_owned_hook_files(directory):
+    """Copilot keeps one hooks file per HubBound feature: ~/.copilot/hooks/hubbound-*.json."""
+    try:
+        entries = sorted(os.listdir(directory))
+    except OSError:
+        return
+    for name in entries:
+        if name.startswith("hubbound-") and name.endswith(".json"):
+            remove_paths(os.path.join(directory, name))
+
+
+def clean_vscode_mcp():
+    if DARWIN:
+        base = os.path.join(HOME, "Library", "Application Support", "Code", "User")
+    else:
+        base = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "Code", "User")
+    clean_named_mcp(os.path.join(base, "mcp.json"))
+
+
+def clean_opencode_and_muse():
+    info("OpenCode / Muse")
+    config = os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config")
+    clean_named_mcp(os.path.join(config, "opencode", "opencode.json"))
+    clean_named_mcp(os.path.join(config, "muse", "settings.json"))
+    for name in ("hubbound-memories.js", "hubbound-memories-v2"):
+        remove_owned_plugin(os.path.join(config, "opencode", "plugins", name))
+    for tool in ("opencode", "muse"):
+        clean_owned_dirs(os.path.join(config, tool, "skills"))
+        clean_markdown_blocks(os.path.join(config, tool, "AGENTS.md"))
+
+
 def clean_claude():
     info("Claude Code")
     clean_claude_settings(os.path.join(HOME, ".claude", "settings.json"))
+    clean_named_mcp(os.path.join(HOME, ".claude.json"))
+    clean_markdown_blocks(os.path.join(HOME, ".claude", "CLAUDE.md"))
     clean_mcp_servers(os.path.join(HOME, ".mcp.json"))
     if DARWIN:
         clean_claude_settings("/Library/Application Support/ClaudeCode/managed-settings.json")
@@ -947,6 +1130,7 @@ def clean_cursor():
     info("Cursor")
     clean_cursor_hooks(os.path.join(HOME, ".cursor", "hooks.json"))
     clean_mcp_servers(os.path.join(HOME, ".cursor", "mcp.json"))
+    clean_named_mcp(os.path.join(HOME, ".cursor", "mcp.json"))
     remove_paths(os.path.join(HOME, ".cursor", "hubbound-hooks"))
     clean_owned_dirs(os.path.join(HOME, ".cursor", "skills"))
     clean_owned_files(os.path.join(HOME, ".cursor", "rules"), ".mdc")
@@ -956,6 +1140,7 @@ def clean_cursor():
 def clean_codex():
     info("Codex CLI")
     clean_codex_config(os.path.join(HOME, ".codex", "config.toml"))
+    clean_claude_settings(os.path.join(HOME, ".codex", "hooks.json"))
     remove_paths(os.path.join(HOME, ".codex", "hubbound-hooks"))
     clean_owned_dirs(os.path.join(HOME, ".agents", "skills"))
     clean_markdown_blocks(os.path.join(HOME, ".codex", "AGENTS.md"))
@@ -964,6 +1149,10 @@ def clean_codex():
 
 def clean_copilot():
     info("Copilot")
+    clean_named_mcp(os.path.join(HOME, ".copilot", "mcp-config.json"))
+    clean_owned_hook_files(os.path.join(HOME, ".copilot", "hooks"))
+    clean_markdown_blocks(os.path.join(HOME, ".copilot", "copilot-instructions.md"))
+    clean_vscode_mcp()
     clean_owned_dirs(os.path.join(HOME, ".copilot", "skills"))
     clean_owned_files(os.path.join(HOME, ".copilot", "agents"), ".agent.md")
 
@@ -971,6 +1160,10 @@ def clean_copilot():
 def clean_antigravity():
     info("Antigravity / Gemini")
     clean_mcp_servers(os.path.join(HOME, ".gemini", "config", "mcp_config.json"))
+    clean_named_mcp(os.path.join(HOME, ".gemini", "config", "mcp_config.json"))
+    clean_named_mcp(os.path.join(HOME, ".gemini", "antigravity-cli", "mcp_config.json"))
+    clean_named_mcp(os.path.join(HOME, ".gemini", "antigravity-cli", "settings.json"))
+    clean_named_mcp(os.path.join(HOME, ".gemini", "settings.json"))
     clean_gemini_hooks(os.path.join(HOME, ".gemini", "config", "hooks.json"))
     remove_paths(os.path.join(HOME, ".gemini", "hubbound-hooks"))
     clean_owned_dirs(os.path.join(HOME, ".gemini", "skills"))
@@ -982,6 +1175,7 @@ clean_cursor()
 clean_codex()
 clean_copilot()
 clean_antigravity()
+clean_opencode_and_muse()
 PYCLEAN
     log_success "Provider integrations cleaned"
   else
