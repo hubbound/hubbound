@@ -51,6 +51,106 @@ function ConvertTo-SingleQuotedPsLiteral([string]$Value) {
   return "'" + ($Value -replace "'", "''") + "'"
 }
 
+# --- HubBound MSI products (HUBJ-314) -----------------------------------------
+# Setup installs the CLI (per-user) and the Runtime (per-machine) as MSI products
+# identified by a fixed UpgradeCode (packaging/windows/hubbound-*-v4.wxs; dev and
+# release builds share them, only the data directory name differs). Deleting
+# their files and service by hand leaves the MSI registration behind, so Setup
+# later reports "already installed" for a machine that has nothing installed.
+# The uninstaller therefore removes the products through Windows Installer and
+# keeps its manual cleanup for leftovers.
+#
+# The three functions below are also embedded in the elevated child scripts, so
+# their bodies must not call any other function of this file and must keep
+# comments outside of them (the encoded command has a length limit).
+$ExitNewerInstall = 42
+
+function Get-HubboundMsiProducts {
+  param([string[]]$Components = @("CLI", "Runtime"))
+  $upgradeCodes = @{ CLI = "{8B3F5A8F-29AB-44E8-9F9D-5B79D94E7D01}"; Runtime = "{4A7943DE-75A4-4A58-9F22-A2CDE9E85EE3}" }
+  $found = @()
+  try { $installer = New-Object -ComObject WindowsInstaller.Installer } catch { return @() }
+  foreach ($component in $Components) {
+    if (-not $upgradeCodes.ContainsKey($component)) { continue }
+    try {
+      $related = $installer.GetType().InvokeMember("RelatedProducts", "GetProperty", $null, $installer, @($upgradeCodes[$component]))
+      foreach ($product in @($related)) {
+        $version = ""
+        try { $version = [string]$installer.GetType().InvokeMember("ProductInfo", "GetProperty", $null, $installer, @($product, "VersionString")) } catch { }
+        $found += [pscustomobject]@{ Component = $component; ProductCode = ([string]$product).ToUpperInvariant(); Version = $version }
+      }
+    } catch { }
+  }
+  return @($found)
+}
+
+function Test-HubboundNewerInstall {
+  param([string[]]$Snapshot, [string[]]$Components)
+  foreach ($product in @(Get-HubboundMsiProducts -Components $Components)) {
+    if (@($Snapshot) -notcontains "$($product.Component)|$($product.ProductCode)|$($product.Version)") { return $true }
+  }
+  return $false
+}
+
+function Uninstall-HubboundMsiProducts {
+  param([string[]]$Snapshot, [string[]]$Components)
+  $failed = 0
+  foreach ($product in @(Get-HubboundMsiProducts -Components $Components)) {
+    if (@($Snapshot) -notcontains "$($product.Component)|$($product.ProductCode)|$($product.Version)") {
+      Write-Host "  ! Skipping $($product.Component) MSI $($product.ProductCode): it was not installed when the uninstall started"
+      continue
+    }
+    Write-Host "    > msiexec /x $($product.ProductCode) ($($product.Component) $($product.Version))"
+    $process = Start-Process -FilePath "$env:SystemRoot\System32\msiexec.exe" -ArgumentList @("/x", $product.ProductCode, "/qn", "/norestart") -Wait -PassThru -WindowStyle Hidden
+    $code = $process.ExitCode
+    if ($code -eq 0 -or $code -eq 1605 -or $code -eq 3010) {
+      Write-Host "  + $($product.Component) MSI removed (exit $code)"
+    } else {
+      Write-Host "  ! $($product.Component) MSI removal failed (exit $code)"
+      $failed++
+    }
+  }
+  return $failed
+}
+
+function Get-HubboundFunctionSource([string]$Name) {
+  return "function $Name {" + [Environment]::NewLine + (Get-Command -Name $Name -CommandType Function).Definition + [Environment]::NewLine + "}"
+}
+
+# "Component|PRODUCTCODE|Version" for every HubBound MSI product registered now.
+function Get-HubboundMsiSnapshot {
+  return @(Get-HubboundMsiProducts | ForEach-Object { "$($_.Component)|$($_.ProductCode)|$($_.Version)" })
+}
+
+# Lines that make an elevated child re-check, right before it destroys
+# anything, that no HubBound MSI product appeared after the uninstall started
+# (UAC can be accepted long after the prompt was raised). The parent turns
+# $ExitNewerInstall into a warning.
+function Get-ElevatedGuardLines {
+  param([string[]]$Components, [switch]$WithUninstall)
+  $snapshotLits = (@($script:MsiSnapshot | ForEach-Object { ConvertTo-SingleQuotedPsLiteral $_ }) -join ", ")
+  $componentLits = (@($Components | ForEach-Object { ConvertTo-SingleQuotedPsLiteral $_ }) -join ", ")
+  $lines = @(
+    (Get-HubboundFunctionSource "Get-HubboundMsiProducts")
+    (Get-HubboundFunctionSource "Test-HubboundNewerInstall")
+  )
+  if ($WithUninstall) { $lines += (Get-HubboundFunctionSource "Uninstall-HubboundMsiProducts") }
+  $lines += "`$msiSnapshot = @($snapshotLits)"
+  $lines += "if (Test-HubboundNewerInstall -Snapshot `$msiSnapshot -Components @($componentLits)) { exit $ExitNewerInstall }"
+  return $lines
+}
+
+# True (after a warning) when a HubBound MSI product of the component appeared
+# after the uninstall started: its files, service and PATH entry are not ours.
+function Test-NewerInstallSkip {
+  param([string]$Component, [string]$What)
+  if (Test-HubboundNewerInstall -Snapshot $script:MsiSnapshot -Components @($Component)) {
+    Write-Warn "A newer HubBound installation was detected; leaving $What in place"
+    return $true
+  }
+  return $false
+}
+
 function Invoke-ElevatedScript {
   param(
     [string]$WorkDir,
@@ -114,7 +214,7 @@ function Remove-HubboundAgentTask {
   $schtasksLit = ConvertTo-SingleQuotedPsLiteral $schtasks
   $agentLits = @($AgentPaths | ForEach-Object { ConvertTo-SingleQuotedPsLiteral $_ }) -join ", "
 
-  $exitCode = Invoke-ElevatedScript -WorkDir $WorkDir -LogPath $LogPath -Lines @(
+  $exitCode = Invoke-ElevatedScript -WorkDir $WorkDir -LogPath $LogPath -Lines (@(Get-ElevatedGuardLines -Components @("Runtime")) + @(
     "`$taskName = $taskLit"
     "`$schtasks = $schtasksLit"
     "`$agentPaths = @($agentLits)"
@@ -126,10 +226,12 @@ function Remove-HubboundAgentTask {
     "& `$schtasks /Query /TN `$taskName 2>`$null | Out-Null"
     "if (`$LASTEXITCODE -eq 0) { exit 1 }"
     "exit 0"
-  )
+  ))
 
   if ($exitCode -eq 0) {
     Write-Ok "User startup registration removed (or was already absent)"
+  } elseif ($exitCode -eq $ExitNewerInstall) {
+    Write-Warn "A newer HubBound installation was detected; leaving its startup registration in place"
   } else {
     Write-Warn "Could not verify removal of scheduled task '$taskName' (exit $exitCode)"
   }
@@ -414,12 +516,16 @@ if ($Preview) {
   Write-Host ""
   Write-Step "Stopping + removing hubboundd Windows service"
   Write-Ok "Daemon uninstalled via hubbound-helper system uninstall"
+  Write-Step "Removing HubBound Runtime MSI"
+  Write-Ok "HubBound Runtime MSI removed"
   Write-Step "Force-removing orphaned Windows service"
   Write-Warn "Service not found, nothing to remove"
   Write-Step "Removing HubboundAgent user startup registration"
   Write-Ok "User startup registration removed"
   Write-Step "Removing system root"
   Write-Ok "System root removed"
+  Write-Step "Removing HubBound CLI MSI registration"
+  Write-Ok "HubBound CLI MSI removed"
   Write-Step "Removing user bin"
   Write-Ok "User bin removed"
   Write-Step "Removing user state + cache"
@@ -492,6 +598,15 @@ if ($PolicyCli) {
   if ($LASTEXITCODE -eq 77) { exit 1 }
 }
 
+# --- MSI snapshot (HUBJ-314) ---------------------------------------------------
+# Record the HubBound MSI products that exist now, before the data prompt and
+# before any UAC prompt. Every destructive step below re-checks against this
+# snapshot so an installation made after the uninstall started (Setup run while
+# a prompt was still open) is never torn down.
+$MsiSnapshot = Get-HubboundMsiSnapshot
+$RuntimeMsiPresent = @($MsiSnapshot | Where-Object { $_ -like "Runtime|*" }).Count -gt 0
+$CliMsiPresent = @($MsiSnapshot | Where-Object { $_ -like "CLI|*" }).Count -gt 0
+
 $KeepUserData = $false
 if ($KeepData) {
   $KeepUserData = $true
@@ -522,6 +637,7 @@ if ($KeepUserData) {
   Write-Title "hubbound: Full uninstall (Windows)"
 }
 Write-Host ""
+foreach ($entry in $MsiSnapshot) { Write-Detail "MSI product: $entry" }
 
 $Tmp = Join-Path ([IO.Path]::GetTempPath()) ([Guid]::NewGuid())
 New-Item -ItemType Directory -Path $Tmp | Out-Null
@@ -585,7 +701,11 @@ try {
   }
 
   # One elevated batch for every install layout keeps UAC to a single prompt.
-  $helperLines = @('$failed = 0')
+  # Its first lines re-check the MSI snapshot: nothing is removed when a
+  # newer Runtime was installed while the UAC prompt was open. $failed is a
+  # bit mask: 1 = helper uninstall failed, 2 = MSI removal failed.
+  $helperLines = @(Get-ElevatedGuardLines -Components @("Runtime") -WithUninstall)
+  $helperLines += '$failed = 0'
   $helperTargets = 0
   $logLit = ConvertTo-SingleQuotedPsLiteral $logPath
   foreach ($root in $ExistingRoots) {
@@ -600,14 +720,25 @@ try {
     $helperTargets++
   }
 
-  if ($helperTargets -gt 0) {
-    $helperLines += 'if ($failed -ne 0) { exit 1 }'
-    $helperLines += 'exit 0'
+  # The Runtime MSI is removed after the helper has stopped the daemon, so the
+  # registration disappears together with the service and its files.
+  if ($RuntimeMsiPresent) {
+    $helperLines += "`$msiFailed = Uninstall-HubboundMsiProducts -Snapshot `$msiSnapshot -Components @('Runtime') 6>> $logLit"
+    $helperLines += 'if ($msiFailed -ne 0) { $failed = $failed -bor 2 }'
+  }
+
+  if ($helperTargets -gt 0 -or $RuntimeMsiPresent) {
+    $helperLines += 'exit $failed'
     $exitCode = Invoke-ElevatedScript -WorkDir $Tmp -LogPath $logPath -Lines $helperLines
     if ($exitCode -eq 0) {
-      Write-Ok "Daemon uninstalled via 'hubbound-helper system uninstall'"
+      if ($helperTargets -gt 0) { Write-Ok "Daemon uninstalled via 'hubbound-helper system uninstall'" }
+      if ($RuntimeMsiPresent) { Write-Ok "HubBound Runtime MSI removed" }
+    } elseif ($exitCode -eq $ExitNewerInstall) {
+      Write-Warn "A newer HubBound Runtime installation was detected; leaving the service, its files and its MSI registration in place"
     } else {
-      Write-Warn "Helper system uninstall failed/not installed (exit $exitCode), continuing"
+      if (($exitCode -band 1) -ne 0) { Write-Warn "Helper system uninstall failed/not installed (exit $exitCode), continuing" }
+      if (($exitCode -band 2) -ne 0) { Write-Warn "Could not remove the HubBound Runtime MSI (see $logPath); Setup may still report it as installed" }
+      if ($exitCode -lt 0 -or $exitCode -gt 3) { Write-Warn "Elevated Runtime uninstall ended with exit $exitCode, continuing" }
     }
   } else {
     Write-Warn "hubbound-helper not found, skipping helper uninstall"
@@ -619,15 +750,19 @@ try {
   Write-Step "Force-removing orphaned Windows service"
   Write-Detail "Service name: hubboundd"
   $svc = Get-Service -Name "hubboundd" -ErrorAction SilentlyContinue
-  if ($svc) {
-    $exitCode = Invoke-ElevatedScript -WorkDir $Tmp -LogPath $logPath -Lines @(
+  if ($svc -and (Test-NewerInstallSkip -Component "Runtime" -What "the hubboundd service")) {
+    # A newer Runtime owns the service now.
+  } elseif ($svc) {
+    $exitCode = Invoke-ElevatedScript -WorkDir $Tmp -LogPath $logPath -Lines (@(Get-ElevatedGuardLines -Components @("Runtime")) + @(
       'Stop-Service -Name hubboundd -Force -ErrorAction SilentlyContinue'
       'sc.exe delete hubboundd | Out-Null'
       'if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }'
       'exit 0'
-    )
+    ))
     if ($exitCode -eq 0) {
       Write-Ok "Windows service removed"
+    } elseif ($exitCode -eq $ExitNewerInstall) {
+      Write-Warn "A newer HubBound installation was detected; leaving the hubboundd service in place"
     } else {
       Write-Warn "Could not delete hubboundd service (exit $exitCode)"
     }
@@ -662,8 +797,10 @@ try {
 
   # --- System roots (force if the helper left leftovers) --------------------
   Write-Step "Removing system root"
-  if ($ExistingRoots.Count -gt 0) {
-    $rootLines = @()
+  if ($ExistingRoots.Count -gt 0 -and (Test-NewerInstallSkip -Component "Runtime" -What "the HubBound system root")) {
+    # A newer Runtime owns the system root now.
+  } elseif ($ExistingRoots.Count -gt 0) {
+    $rootLines = @(Get-ElevatedGuardLines -Components @("Runtime"))
     foreach ($root in $ExistingRoots) {
       Write-Detail "Path: $root"
       $rootLit = ConvertTo-SingleQuotedPsLiteral $root
@@ -674,6 +811,8 @@ try {
     $exitCode = Invoke-ElevatedScript -WorkDir $Tmp -LogPath $logPath -Lines $rootLines
     if ($exitCode -eq 0) {
       Write-Ok "System root removed"
+    } elseif ($exitCode -eq $ExitNewerInstall) {
+      Write-Warn "A newer HubBound installation was detected; leaving the system root in place"
     } else {
       Write-Warn "System root still present after elevated remove"
     }
@@ -682,10 +821,26 @@ try {
     Write-Warn "System root not found"
   }
 
+  # --- CLI MSI (per-user, no elevation) ---------------------------------------
+  Write-Step "Removing HubBound CLI MSI registration"
+  $SkipCliCleanup = $false
+  if ($CliMsiPresent) {
+    if (Test-NewerInstallSkip -Component "CLI" -What "the HubBound CLI") {
+      $SkipCliCleanup = $true
+    } else {
+      $cliMsiFailed = Uninstall-HubboundMsiProducts -Snapshot $MsiSnapshot -Components @("CLI")
+      if ($cliMsiFailed -ne 0) { Write-Warn "Could not remove the HubBound CLI MSI; Setup may still report it as installed" }
+    }
+  } else {
+    Write-Detail "No HubBound CLI MSI is registered"
+  }
+
   # --- User bin copies ------------------------------------------------------
   Write-Step "Removing user bin"
   Write-Detail "Path: $UserBin"
-  if (Test-Path -LiteralPath $UserBin) {
+  if ($SkipCliCleanup -or (Test-NewerInstallSkip -Component "CLI" -What "the HubBound CLI bin directory")) {
+    $SkipCliCleanup = $true
+  } elseif (Test-Path -LiteralPath $UserBin) {
     Remove-Item -LiteralPath $UserBin -Recurse -Force -ErrorAction SilentlyContinue
     $parent = Split-Path -Parent $UserBin
     if ((Test-Path -LiteralPath $parent) -and -not (Get-ChildItem -LiteralPath $parent -Force -ErrorAction SilentlyContinue)) {
@@ -743,7 +898,9 @@ try {
   # --- User PATH entry (inverse of install.ps1) -----------------------------
   Write-Step "Removing user PATH entry"
   $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
-  if ($UserPath) {
+  if ($SkipCliCleanup -or (Test-NewerInstallSkip -Component "CLI" -What "the HubBound CLI PATH entry")) {
+    # A newer CLI owns the PATH entry now.
+  } elseif ($UserPath) {
     $target = $UserBin.TrimEnd('\')
     $parts = @($UserPath -split ';' | Where-Object { $_ })
     $kept = @($parts | Where-Object { $_.TrimEnd('\') -ne $target })
