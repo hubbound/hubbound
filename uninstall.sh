@@ -184,6 +184,9 @@ else
   USER_CACHE_DIRS+=("$HOME/.cache/hubbound" "$HOME/.cache/hubbound-lab")
 fi
 
+# Muse and OpenCode keep their configuration under XDG_CONFIG_HOME.
+XDG_CONFIG_HOME_DIR="${XDG_CONFIG_HOME:-$HOME/.config}"
+
 EDITOR_DIRS=(
   "$HOME/.claude/hubbound"
   "$HOME/.claude/hubbound-hooks"
@@ -192,8 +195,14 @@ EDITOR_DIRS=(
   "$HOME/.codex/hubbound"
   "$HOME/.codex/hubbound-hooks"
   "$HOME/.copilot/hubbound"
+  "$HOME/.copilot/hubbound-hooks"
   "$HOME/.gemini/hubbound"
   "$HOME/.gemini/hubbound-hooks"
+  "$HOME/.antigravity/hubbound"
+  "$XDG_CONFIG_HOME_DIR/muse/hubbound"
+  "$XDG_CONFIG_HOME_DIR/muse/hubbound-hooks"
+  "$XDG_CONFIG_HOME_DIR/opencode/hubbound"
+  "$XDG_CONFIG_HOME_DIR/opencode/hubbound-hooks"
 )
 
 echo ""
@@ -662,6 +671,9 @@ def write_json(path, doc):
 
 OWN_SERVERS = ("hubbound-memories", "hubbound-live-docs", "hubbound-toolkit", "hubbound-artifacts")
 HOOK_COMMAND = re.compile(r"hubbound(?:\.exe)?['\"]?\s+(?:memory|workspace|live-docs|live-planning)\s+hook\b")
+# The provenance capture hooks run HubBound's own script (hubbound-hook-capture.*)
+# and the distributed hook artifacts run scripts under a hubbound-hooks directory.
+OWN_HOOK_SCRIPT = re.compile(r"hubbound-hook-capture\.(?:sh|ps1)|[/\\]hubbound-hooks[/\\]")
 
 
 def runs_hubbound(command):
@@ -680,7 +692,7 @@ def is_hook_command(value):
         return True
     for key in ("command", "command_windows", "commandWindows", "bash", "powershell"):
         text = value.get(key)
-        if isinstance(text, str) and HOOK_COMMAND.search(text):
+        if isinstance(text, str) and (HOOK_COMMAND.search(text) or OWN_HOOK_SCRIPT.search(text)):
             return True
     return False
 
@@ -821,11 +833,31 @@ def clean_cursor_hooks(path):
         write_json(path, doc)
 
 
+def block_runs_hubbound(node):
+    """True when any command string nested in a Gemini/Antigravity hook block is a HubBound hook."""
+    if isinstance(node, dict):
+        if is_hook_command(node):
+            return True
+        return any(block_runs_hubbound(v) for v in node.values())
+    if isinstance(node, list):
+        return any(block_runs_hubbound(v) for v in node)
+    return False
+
+
 def clean_gemini_hooks(path):
     doc = read_json(path)
     if not doc:
         return
-    removed = [key for key in doc if isinstance(key, str) and key.startswith("hubbound-artifact-")]
+    # Named blocks: distributed artifacts (hubbound-artifact-*) and the Go-installed
+    # hubbound-workspace / hubbound-live-docs / hubbound-memories blocks, matched by
+    # their HubBound hook command so a user's own block of a similar name stays.
+    removed = [
+        key
+        for key, block in doc.items()
+        if isinstance(key, str)
+        and key.startswith("hubbound-")
+        and (key.startswith("hubbound-artifact-") or block_runs_hubbound(block))
+    ]
     if not removed:
         return
     for key in removed:
@@ -1096,12 +1128,65 @@ def clean_vscode_mcp():
     clean_named_mcp(os.path.join(base, "mcp.json"))
 
 
+def clean_owned_hook_plugins(directory):
+    """OpenCode hook artifacts are plugins named hubbound-hook-*.ts that open with a marker line."""
+    try:
+        entries = sorted(os.listdir(directory))
+    except OSError:
+        return
+    for name in entries:
+        target = os.path.join(directory, name)
+        if not (name.startswith("hubbound-hook-") and name.endswith(".ts") and os.path.isfile(target)):
+            continue
+        try:
+            with open(target, "r", encoding="utf-8", errors="replace") as handle:
+                owned = "// hubbound:artifact " in handle.read(1024)
+        except OSError:
+            continue
+        if owned:
+            remove_paths(target)
+
+
+def clean_opencode_plugin_entries(path):
+    """Drops the capture plugin from opencode.json's plugin list (hubbound/hubbound-capture*)."""
+    doc = read_json(path)
+    if not doc:
+        return
+    plugins = doc.get("plugin")
+    if not isinstance(plugins, list):
+        return
+
+    def own(entry):
+        name = entry[0] if isinstance(entry, list) and entry else entry
+        return isinstance(name, str) and re.search(r"[/\\]hubbound[/\\]hubbound-capture", name) is not None
+
+    kept = [entry for entry in plugins if not own(entry)]
+    if len(kept) == len(plugins):
+        return
+    doc["plugin"] = kept
+    detail("removed the capture plugin entry")
+    write_json(path, doc)
+
+
 def clean_opencode_and_muse():
     info("OpenCode / Muse")
     config = os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config")
     clean_named_mcp(os.path.join(config, "opencode", "opencode.json"))
+    clean_opencode_plugin_entries(os.path.join(config, "opencode", "opencode.json"))
     clean_named_mcp(os.path.join(config, "muse", "settings.json"))
-    for name in ("hubbound-memories.js", "hubbound-memories-v2"):
+    # Muse settings.json shares the Claude hooks layout (event -> groups -> handlers).
+    clean_claude_settings(os.path.join(config, "muse", "settings.json"))
+    clean_owned_files(os.path.join(config, "opencode", "command"), ".md")
+    clean_owned_files(os.path.join(config, "opencode", "agent"), ".md")
+    clean_owned_hook_plugins(os.path.join(config, "opencode", "plugins"))
+    for name in (
+        "hubbound-memories.js",
+        "hubbound-memories-v2",
+        "hubbound-workspace.js",
+        "hubbound-workspace-v2",
+        "hubbound-live-docs.js",
+        "hubbound-live-docs-v2",
+    ):
         remove_owned_plugin(os.path.join(config, "opencode", "plugins", name))
     for tool in ("opencode", "muse"):
         clean_owned_dirs(os.path.join(config, tool, "skills"))
@@ -1167,6 +1252,7 @@ def clean_antigravity():
     clean_gemini_hooks(os.path.join(HOME, ".gemini", "config", "hooks.json"))
     remove_paths(os.path.join(HOME, ".gemini", "hubbound-hooks"))
     clean_owned_dirs(os.path.join(HOME, ".gemini", "skills"))
+    clean_owned_dirs(os.path.join(HOME, ".gemini", "config", "skills"))
     clean_markdown_blocks(os.path.join(HOME, ".gemini", "GEMINI.md"))
 
 

@@ -355,6 +355,34 @@ function Test-HubboundEntry {
   return ($null -ne $source -and $source.Value -eq "hubbound")
 }
 
+# Hooks the Go installers wrote carry no marker: they run `hubbound ... hook`, the
+# provenance capture script (hubbound-hook-capture.*) or a script kept under a
+# hubbound-hooks directory.
+# Go writes Windows hooks as `powershell ... -EncodedCommand <base64 UTF-16LE>`: the
+# command line only carries the payload, so decode it before matching.
+function Expand-HubboundHookCommand {
+  param([string]$Text)
+  $match = [regex]::Match($Text, '-EncodedCommand\s+([A-Za-z0-9+/=]+)')
+  if (-not $match.Success) { return $Text }
+  try {
+    $decoded = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($match.Groups[1].Value))
+    return "$Text`n$decoded"
+  } catch { return $Text }
+}
+
+function Test-HubboundHookEntry {
+  param($Entry)
+  if (Test-HubboundEntry -Entry $Entry) { return $true }
+  foreach ($key in @("command", "command_windows", "commandWindows", "bash", "powershell")) {
+    $property = Get-JsonProperty -Object $Entry -Name $key
+    if ($null -eq $property -or $property.Value -isnot [string]) { continue }
+    $text = Expand-HubboundHookCommand -Text $property.Value
+    if ($text -match 'hubbound(\.exe)?[''"]?\s+(memory|workspace|live-docs|live-planning)\s+hook\b') { return $true }
+    if ($text -match 'hubbound-hook-capture\.(sh|ps1)|[/\\]hubbound-hooks[/\\]') { return $true }
+  }
+  return $false
+}
+
 function Remove-HubboundMcpServers {
   param([string]$Path)
   $doc = Read-JsonFile -Path $Path
@@ -426,11 +454,11 @@ function Remove-HubboundHookEntries {
     $kept = @()
     foreach ($entry in $entries) {
       # Cursor stores handlers directly; Claude nests them under a group.
-      if (Test-HubboundEntry -Entry $entry) { $changed = $true; continue }
+      if (Test-HubboundHookEntry -Entry $entry) { $changed = $true; continue }
       $nested = Get-JsonProperty -Object $entry -Name "hooks"
       if ($null -ne $nested -and $nested.Value -is [Array]) {
         $handlers = @($nested.Value)
-        $keptHandlers = @($handlers | Where-Object { -not (Test-HubboundEntry -Entry $_) })
+        $keptHandlers = @($handlers | Where-Object { -not (Test-HubboundHookEntry -Entry $_) })
         if ($keptHandlers.Count -ne $handlers.Count) { $changed = $true }
         if ($keptHandlers.Count -eq 0) { continue }
         $nested.Value = $keptHandlers
@@ -473,6 +501,116 @@ function Remove-HubboundArtifactFiles {
   }
 }
 
+# Gemini/Antigravity hooks.json keeps one hubbound-artifact-<id> block per hook artifact.
+# True when any command nested in a hook block is a HubBound hook command.
+function Test-HubboundHookBlock {
+  param($Block)
+  if ($null -eq $Block) { return $false }
+  if ($Block -is [string]) { return $false }
+  if ($Block -is [Array]) {
+    foreach ($item in $Block) { if (Test-HubboundHookBlock -Block $item) { return $true } }
+    return $false
+  }
+  if (Test-HubboundHookEntry -Entry $Block) { return $true }
+  $properties = $null
+  try { $properties = $Block.PSObject.Properties } catch { return $false }
+  foreach ($property in @($properties)) {
+    if ($property.Value -isnot [string] -and (Test-HubboundHookBlock -Block $property.Value)) { return $true }
+  }
+  return $false
+}
+
+function Remove-HubboundHookBlocks {
+  param([string]$Path)
+  $doc = Read-JsonFile -Path $Path
+  if ($null -eq $doc) { return }
+  # Distributed artifacts (hubbound-artifact-*) and the Go-installed hubbound-workspace /
+  # hubbound-live-docs / hubbound-memories blocks, matched by their HubBound hook command.
+  $names = @($doc.PSObject.Properties | Where-Object {
+      $_.Name -like "hubbound-artifact-*" -or ($_.Name -like "hubbound-*" -and (Test-HubboundHookBlock -Block $_.Value))
+    } | ForEach-Object { $_.Name })
+  if ($names.Count -eq 0) { return }
+  foreach ($name in $names) { $doc.PSObject.Properties.Remove($name) }
+  Write-JsonFile -Path $Path -Document $doc
+  Write-Detail "Removed hook block(s) from ${Path}: $($names -join ', ')"
+}
+
+# Copilot keeps one hooks file per HubBound feature: ~/.copilot/hooks/hubbound-*.json.
+function Remove-HubboundHookFiles {
+  param([string]$Path)
+  if (-not (Test-Path -LiteralPath $Path)) { return }
+  foreach ($file in @(Get-ChildItem -LiteralPath $Path -File -Filter "hubbound-*.json" -Force -ErrorAction SilentlyContinue)) {
+    Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
+    Write-Detail "Removed hook file: $($file.FullName)"
+  }
+}
+
+# OpenCode hook artifacts are plugins named hubbound-hook-*.ts that open with a marker line.
+function Remove-HubboundHookPlugins {
+  param([string]$Path)
+  if (-not (Test-Path -LiteralPath $Path)) { return }
+  foreach ($file in @(Get-ChildItem -LiteralPath $Path -File -Filter "hubbound-hook-*.ts" -Force -ErrorAction SilentlyContinue)) {
+    $head = Get-Content -LiteralPath $file.FullName -TotalCount 3 -ErrorAction SilentlyContinue
+    if ($null -eq $head -or -not (($head -join "`n").Contains("// hubbound:artifact "))) { continue }
+    Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
+    Write-Detail "Removed plugin: $($file.FullName)"
+  }
+}
+
+# OpenCode plugins written by the Memories, Workspace and Live Documents installers: a file or a
+# directory whose content opens with the "HubBound managed" ownership header.
+function Remove-HubboundOwnedPlugin {
+  param([string]$Path)
+  $header = "HubBound managed"
+  if (Test-Path -LiteralPath $Path -PathType Leaf) {
+    $head = Get-Content -LiteralPath $Path -TotalCount 3 -ErrorAction SilentlyContinue
+    if ($null -ne $head -and ($head -join "`n").Contains($header)) {
+      Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+      Write-Detail "Removed plugin: $Path"
+    }
+  } elseif (Test-Path -LiteralPath $Path -PathType Container) {
+    foreach ($file in @(Get-ChildItem -LiteralPath $Path -File -Force -ErrorAction SilentlyContinue)) {
+      $head = Get-Content -LiteralPath $file.FullName -TotalCount 3 -ErrorAction SilentlyContinue
+      if ($null -ne $head -and ($head -join "`n").Contains($header)) {
+        Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Detail "Removed plugin: $Path"
+        return
+      }
+    }
+  }
+}
+
+# The capture plugin is referenced from opencode.json (hubbound/hubbound-capture*).
+function Remove-HubboundOpenCodePluginEntries {
+  param([string]$Path)
+  $doc = Read-JsonFile -Path $Path
+  if ($null -eq $doc) { return }
+  $plugins = Get-JsonProperty -Object $doc -Name "plugin"
+  if ($null -eq $plugins -or $plugins.Value -isnot [Array]) { return }
+  $entries = @($plugins.Value)
+  $kept = @($entries | Where-Object {
+      $name = if ($_ -is [Array] -and $_.Count -gt 0) { $_[0] } else { $_ }
+      -not ($name -is [string] -and $name -match '[/\\]hubbound[/\\]hubbound-capture')
+    })
+  if ($kept.Count -eq $entries.Count) { return }
+  $plugins.Value = $kept
+  Write-JsonFile -Path $Path -Document $doc
+  Write-Detail "Removed the capture plugin entry from $Path"
+}
+
+# Removes the <!-- hubbound:artifact ... BEGIN/END --> blocks of an instruction file.
+function Remove-HubboundMarkdownBlocks {
+  param([string]$Path)
+  if (-not (Test-Path -LiteralPath $Path)) { return }
+  $original = Get-Content -LiteralPath $Path -Raw -ErrorAction SilentlyContinue
+  if ([string]::IsNullOrEmpty($original)) { return }
+  $pattern = '(?s)<!-- hubbound:artifact [^>]+ BEGIN -->.*?<!-- hubbound:artifact [^>]+ END -->\r?\n?'
+  $cleaned = [regex]::Replace($original, $pattern, "")
+  if ($cleaned -eq $original) { return }
+  [IO.File]::WriteAllText($Path, $cleaned.Trim() + "`n", (New-Object Text.UTF8Encoding($false)))
+  Write-Detail "Removed HubBound blocks from $Path"
+}
+
 function Invoke-ProviderCleanupFallback {
   param([string]$HomeDir, [string[]]$EditorDirs)
 
@@ -487,16 +625,39 @@ function Invoke-ProviderCleanupFallback {
   foreach ($mcpFile in @(
       ".claude.json", ".cursor\mcp.json", ".copilot\mcp-config.json",
       ".gemini\config\mcp_config.json", ".gemini\antigravity-cli\mcp_config.json",
-      ".config\opencode\opencode.json", ".config\muse\settings.json",
       "AppData\Roaming\Code\User\mcp.json")) {
     Remove-HubboundNamedMcp -Path (Join-Path $HomeDir $mcpFile)
   }
+  $McpConfigHome = if ($env:XDG_CONFIG_HOME) { $env:XDG_CONFIG_HOME } else { Join-Path $HomeDir ".config" }
+  foreach ($mcpFile in @("opencode\opencode.json", "muse\settings.json")) {
+    Remove-HubboundNamedMcp -Path (Join-Path $McpConfigHome $mcpFile)
+  }
+  $ConfigHome = if ($env:XDG_CONFIG_HOME) { $env:XDG_CONFIG_HOME } else { Join-Path $HomeDir ".config" }
   Remove-HubboundHookEntries -Path (Join-Path $HomeDir ".cursor\hooks.json")
   Remove-HubboundHookEntries -Path (Join-Path $HomeDir ".claude\settings.json")
+  Remove-HubboundHookEntries -Path (Join-Path $HomeDir ".codex\hooks.json")
+  # Muse settings.json shares the Claude hooks layout.
+  Remove-HubboundHookEntries -Path (Join-Path $ConfigHome "muse\settings.json")
+  Remove-HubboundHookBlocks -Path (Join-Path $HomeDir ".gemini\config\hooks.json")
+  Remove-HubboundHookFiles -Path (Join-Path $HomeDir ".copilot\hooks")
+  Remove-HubboundOpenCodePluginEntries -Path (Join-Path $ConfigHome "opencode\opencode.json")
+  Remove-HubboundHookPlugins -Path (Join-Path $ConfigHome "opencode\plugins")
+  foreach ($plugin in @("hubbound-memories.js", "hubbound-memories-v2", "hubbound-workspace.js", "hubbound-workspace-v2", "hubbound-live-docs.js", "hubbound-live-docs-v2")) {
+    Remove-HubboundOwnedPlugin -Path (Join-Path $ConfigHome "opencode\plugins\$plugin")
+  }
 
-  foreach ($skills in @(".claude\skills", ".cursor\skills", ".copilot\skills", ".gemini\skills", ".agents\skills")) {
+  foreach ($skills in @(".claude\skills", ".cursor\skills", ".copilot\skills", ".gemini\skills", ".gemini\config\skills", ".agents\skills")) {
     Remove-HubboundSkillDirs -Path (Join-Path $HomeDir $skills)
   }
+  foreach ($tool in @("opencode", "muse")) {
+    Remove-HubboundSkillDirs -Path (Join-Path $ConfigHome "$tool\skills")
+    Remove-HubboundMarkdownBlocks -Path (Join-Path $ConfigHome "$tool\AGENTS.md")
+  }
+  foreach ($block in @(".claude\CLAUDE.md", ".codex\AGENTS.md", ".copilot\copilot-instructions.md", ".gemini\GEMINI.md")) {
+    Remove-HubboundMarkdownBlocks -Path (Join-Path $HomeDir $block)
+  }
+  Remove-HubboundArtifactFiles -Path (Join-Path $ConfigHome "opencode\command") -Filter "*.md"
+  Remove-HubboundArtifactFiles -Path (Join-Path $ConfigHome "opencode\agent") -Filter "*.md"
 
   Remove-HubboundArtifactFiles -Path (Join-Path $HomeDir ".claude\rules") -Filter "*.md"
   Remove-HubboundArtifactFiles -Path (Join-Path $HomeDir ".claude\agents") -Filter "*.md"
@@ -562,6 +723,9 @@ $UserBin = if ($env:HUBBOUND_USER_BIN) { $env:HUBBOUND_USER_BIN } else { Join-Pa
 $UserStateDirs = @($DataDirNames | ForEach-Object { Join-Path $AppData $_ })
 $UserCacheDirs = @($DataDirNames | ForEach-Object { Join-Path $LocalAppData $_ })
 
+# Muse and OpenCode keep their configuration under XDG_CONFIG_HOME.
+$EditorConfigHome = if ($env:XDG_CONFIG_HOME) { $env:XDG_CONFIG_HOME } else { Join-Path $HomeDir ".config" }
+
 $EditorDirs = @(
   (Join-Path $HomeDir ".claude\hubbound"),
   (Join-Path $HomeDir ".claude\hubbound-hooks"),
@@ -570,8 +734,14 @@ $EditorDirs = @(
   (Join-Path $HomeDir ".codex\hubbound"),
   (Join-Path $HomeDir ".codex\hubbound-hooks"),
   (Join-Path $HomeDir ".copilot\hubbound"),
+  (Join-Path $HomeDir ".copilot\hubbound-hooks"),
   (Join-Path $HomeDir ".gemini\hubbound"),
-  (Join-Path $HomeDir ".gemini\hubbound-hooks")
+  (Join-Path $HomeDir ".gemini\hubbound-hooks"),
+  (Join-Path $HomeDir ".antigravity\hubbound"),
+  (Join-Path $EditorConfigHome "muse\hubbound"),
+  (Join-Path $EditorConfigHome "muse\hubbound-hooks"),
+  (Join-Path $EditorConfigHome "opencode\hubbound"),
+  (Join-Path $EditorConfigHome "opencode\hubbound-hooks")
 )
 
 $AgentPaths = @($SystemRoots | ForEach-Object { Join-Path $_ "current\hubbound-agent.exe" })
