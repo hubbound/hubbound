@@ -367,6 +367,26 @@ else
   log_warn "hubbound not on PATH, falling back to the helper"
 fi
 
+# macOS: boot out and remove HubBound launchd units that are left over (for
+# example net.hubbound.lpdev pointing at deleted dev binaries) and reset the
+# privacy (TCC) entries tccutil can address by bundle id. The helper is the same
+# one `hubbound support cleanup --yes` uses; it must run before the system root
+# (and the helper with it) is removed. Never a reset without a client.
+MAC_PRIVACY_NOTE=0
+if [ "$OS" = "Darwin" ]; then
+  for root in "${SYSTEM_ROOTS[@]}"; do
+    helper="$root/current/hubbound-helper"
+    [ -x "$helper" ] || continue
+    log_info "Cleaning orphan launchd units and privacy entries"
+    if run_priv "$helper" system cleanup --system-root "$root" --apply --uninstall; then
+      log_success "Cleanup completed for $root"
+    else
+      log_warn "Cleanup failed or this helper has no cleanup command (continuing)"
+    fi
+    MAC_PRIVACY_NOTE=1
+  done
+fi
+
 for root in "${SYSTEM_ROOTS[@]}"; do
   helper="$root/current/hubbound-helper"
   if [ -x "$helper" ]; then
@@ -1320,6 +1340,18 @@ done
 if [ "$OS" = "Darwin" ] && [ -f /Library/LaunchDaemons/hubboundd.plist ]; then
   log_error "LaunchDaemon still present: /Library/LaunchDaemons/hubboundd.plist"
   PRIV_FAILURES=$((PRIV_FAILURES + 1))
+fi
+
+# macOS keeps one Full Disk Access row per old hubboundd release and no program
+# can remove them (TCC.db is protected and tccutil only takes a bundle id).
+if [ "$MAC_PRIVACY_NOTE" -eq 1 ]; then
+  echo ""
+  log_info "Old privacy entries / Entradas de privacidad antiguas"
+  log_detail "In System Settings > Privacy & Security > Full Disk Access, select each hubboundd row and click the \"−\" button."
+  log_detail "En Ajustes del Sistema > Privacidad y seguridad > Acceso total al disco, selecciona cada fila hubboundd y pulsa el botón \"−\"."
+  if [ -t 0 ] && [ -t 1 ] && [ "$(id -u)" -ne 0 ]; then
+    open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles" >/dev/null 2>&1 || true
+  fi
 fi
 
 # ─── Summary ─────────────────────────────────────────────────────────────────
