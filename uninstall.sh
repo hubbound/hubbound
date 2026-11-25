@@ -571,6 +571,26 @@ if [[ "$OS" = "Darwin" ]]; then
   fi
 fi
 
+# ─── Desktop app (macOS) ─────────────────────────────────────────────────────
+# HubBound.app (net.hubbound.desktop) is installed by the Runtime package.
+if [[ "$OS" = "Darwin" ]]; then
+  log_info "Removing the HubBound desktop app"
+  desktop_removed=0
+  for app in "$HOME/Applications/HubBound.app" "/Applications/HubBound.app"; do
+    [[ -e "$app" ]] || continue
+    log_detail "Path: $app"
+    if remove_path "$app"; then
+      log_success "Removed $app"
+      desktop_removed=$((desktop_removed + 1))
+    else
+      log_warn "Could not remove $app"
+    fi
+  done
+  if [[ "$desktop_removed" -eq 0 ]]; then
+    log_warn "No HubBound desktop app found"
+  fi
+fi
+
 # ─── Shell PATH block ────────────────────────────────────────────────────────
 log_info "Removing the shell PATH entry"
 rc_cleaned=0
